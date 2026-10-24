@@ -56,7 +56,16 @@ static int cmd_mount(int argc, char **argv)
     fargv[fargc++] = "fsname=chronofs,subtype=chronofs,default_permissions";
     for (i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--cache-blocks") && i + 1 < argc) {
-            cache_blocks = (size_t)strtoul(argv[++i], NULL, 10);
+            char *end;
+            unsigned long parsed;
+            errno = 0;
+            parsed = strtoul(argv[++i], &end, 10);
+            if (errno || !argv[i][0] || argv[i][0] == '-' || *end ||
+                parsed == 0 || parsed > INT_MAX / 2 || parsed > SIZE_MAX / (BLOCK_SIZE * 2)) {
+                fprintf(stderr, "chronofs: --cache-blocks requires a positive, bounded integer\n");
+                return 2;
+            }
+            cache_blocks = (size_t)parsed;
         } else if ((!strcmp(argv[i], "-f") || !strcmp(argv[i], "-d") || !strcmp(argv[i], "-s"))
                    && fargc < 28) {
             fargv[fargc++] = argv[i];
@@ -94,6 +103,8 @@ static int cmd_mount(int argc, char **argv)
     lockfd = open(lockp, O_RDWR | O_CREAT, 0644);
     if (lockfd < 0 || flock(lockfd, LOCK_EX | LOCK_NB) < 0) {
         fprintf(stderr, "chronofs: %s is already mounted\n", st.root);
+        if (lockfd >= 0)
+            close(lockfd);
         store_close(&st);
         return 1;
     }

@@ -1,0 +1,21 @@
+name: Build and test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        ncurses: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libfuse3-dev libncurses-dev python3
+      - run: make -j2 test HAVE_NCURSES=${{ matrix.ncurses }}
+  sanitizers:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libfuse3-dev python3
+      - run: >-
+          make -j2 test HAVE_NCURSES=0
+          CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -fno-pie'
+          LDLIBS='-fsanitize=address,undefined -no-pie'

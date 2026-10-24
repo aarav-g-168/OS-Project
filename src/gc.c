@@ -8,8 +8,7 @@
  *    state), so every snapshot inside the window stays exact.
  * 2. Mark: every manifest referenced by a kept record, and every block those
  *    manifests list, is marked reachable.
- * 3. Sweep: unmarked manifests and blocks are deleted, and the journal is
- *    rewritten atomically (write temp file, fsync, rename).
+ * 3. Commit the retained journal before sweeping unmarked manifests and blocks.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -37,7 +36,14 @@ static int hset_init(struct hset *s, size_t cap)
     s->n = 0;
     s->keys = malloc(s->cap * HASH_LEN);
     s->used = calloc(s->cap, 1);
-    return (s->keys && s->used) ? 0 : -ENOMEM;
+    if (!s->keys || !s->used) {
+        free(s->keys);
+        free(s->used);
+        s->keys = NULL;
+        s->used = NULL;
+        return -ENOMEM;
+    }
+    return 0;
 }
 
 static void hset_free(struct hset *s)
@@ -145,7 +151,7 @@ int cmd_gc(int argc, char **argv)
 {
     struct store st;
     struct jrec *recs = NULL;
-    struct hset mset, bset;
+    struct hset mset = {0}, bset = {0};
     char *keep_s = NULL, p[PATH_MAX], tmp[PATH_MAX], tbuf[64], b1[32], b2[32];
     char line[512], name[256];
     size_t n, i, kept = 0, rm_blocks = 0, rm_mans = 0;
@@ -170,8 +176,10 @@ int cmd_gc(int argc, char **argv)
         fprintf(stderr, "chronofs: bad duration '%s' (e.g. 30s, 10min, 2h, 7d)\n", keep_s);
         return 2;
     }
-    if (store_open(&st, argv[0], 0) < 0)
+    if ((j = store_open(&st, argv[0], 0)) < 0) {
+        fprintf(stderr, "chronofs: cannot open store: %s\n", strerror(-j));
         return 1;
+    }
 
     /* Refuse to run while mounted: the daemon holds this lock. */
     store_path(&st, p, sizeof(p), "lock");
@@ -202,25 +210,31 @@ int cmd_gc(int argc, char **argv)
 
     /* 2. Mark. */
     if (hset_init(&mset, kept + 16) < 0 || hset_init(&bset, 1024) < 0)
-        goto out_mask;
+        goto out_sets;
     for (i = 0; i < n; i++) {
         uint8_t (*blocks)[HASH_LEN];
         uint64_t size;
         size_t nb, k;
-        if (!keepmask[i] || recs[i].op != OP_WRITE || hset_add(&mset, recs[i].manifest) != 1)
+        int added;
+        if (!keepmask[i] || recs[i].op != OP_WRITE)
+            continue;
+        added = hset_add(&mset, recs[i].manifest);
+        if (added < 0)
+            goto out_sets;
+        if (!added)
             continue;
         if (bs_get_manifest(&st, recs[i].manifest, &size, &blocks, &nb) < 0) {
-            fprintf(stderr, "chronofs: warning: manifest missing for %s\n", recs[i].path);
-            continue;
+            fprintf(stderr, "chronofs: cannot read retained manifest for %s; gc aborted\n", recs[i].path);
+            goto out_sets;
         }
-        for (k = 0; k < nb; k++)
-            hset_add(&bset, blocks[k]);
+        for (k = 0; k < nb; k++) {
+            if (hset_add(&bset, blocks[k]) < 0) {
+                free(blocks);
+                goto out_sets;
+            }
+        }
         free(blocks);
     }
-
-    /* 3. Sweep. */
-    sweep(&st, "objects", &bset, dry, &rm_blocks, &blk_bytes);
-    sweep(&st, "manifests", &mset, dry, &rm_mans, &man_bytes);
 
     if (!dry) {
         /* Rewrite the journal with only the kept records. */
@@ -236,10 +250,26 @@ int cmd_gc(int argc, char **argv)
                 goto out_sets;
             }
         }
-        fsync(fd);
-        close(fd);
+        if (fsync(fd) < 0) {
+            close(fd);
+            unlink(tmp);
+            goto out_sets;
+        }
+        if (close(fd) < 0) {
+            unlink(tmp);
+            goto out_sets;
+        }
         if (rename(tmp, p) < 0)
             goto out_sets;
+        /* Persist the new journal name before freeing its old objects. */
+        fd = open(st.root, O_RDONLY | O_DIRECTORY);
+        if (fd < 0)
+            goto out_sets;
+        if (fsync(fd) < 0) {
+            close(fd);
+            goto out_sets;
+        }
+        close(fd);
 
         /* Tags older than the window can no longer be shown exactly. */
         store_path(&st, p, sizeof(p), "tags");
@@ -260,6 +290,10 @@ int cmd_gc(int argc, char **argv)
         }
     }
 
+    /* Commit retention before deleting anything: interruption leaves only orphans. */
+    sweep(&st, "objects", &bset, dry, &rm_blocks, &blk_bytes);
+    sweep(&st, "manifests", &mset, dry, &rm_mans, &man_bytes);
+
     fmt_size(blk_bytes, b1, sizeof(b1));
     fmt_size(man_bytes, b2, sizeof(b2));
     printf("%sretention window: history since %s\n", dry ? "[dry run] " : "", tbuf);
@@ -272,7 +306,6 @@ int cmd_gc(int argc, char **argv)
 out_sets:
     hset_free(&mset);
     hset_free(&bset);
-out_mask:
     free(keepmask);
 out:
     free(recs);

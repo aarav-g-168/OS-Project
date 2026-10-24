@@ -14,6 +14,7 @@
  */
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,6 +73,8 @@ int parse_duration(const char *s, int64_t *out_ns)
         } else if (unit_ns(u, (size_t)(p - u), &mul) < 0) {
             return -1;
         }
+        if (num > (INT64_MAX - total) / mul)
+            return -1;
         total += num * mul;
     }
     *out_ns = total;
@@ -88,7 +91,13 @@ static int parse_absolute(const char *s, int64_t *out)
     size_t len = strlen(s);
 
     if (len > 0 && strspn(s, "0123456789") == len) {
-        *out = strtoll(s, NULL, 10) * NS_PER_SEC + NS_PER_SEC - 1;
+        char *end;
+        long long seconds;
+        errno = 0;
+        seconds = strtoll(s, &end, 10);
+        if (errno || *end || seconds > (INT64_MAX - NS_PER_SEC + 1) / NS_PER_SEC)
+            return -1;
+        *out = seconds * NS_PER_SEC + NS_PER_SEC - 1;
         return 0;
     }
 
@@ -137,6 +146,10 @@ static int parse_absolute(const char *s, int64_t *out)
     tm.tm_isdst = -1;
     t = mktime(&tm);
     if (t == (time_t)-1)
+        return -1;
+    if (tm.tm_year != Y - 1900 || tm.tm_mon != M - 1 || tm.tm_mday != D ||
+        tm.tm_hour != h || tm.tm_min != m || tm.tm_sec != sec ||
+        t < 0 || (uint64_t)t > (uint64_t)(INT64_MAX - extra) / NS_PER_SEC)
         return -1;
     *out = (int64_t)t * NS_PER_SEC + extra;
     return 0;

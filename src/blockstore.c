@@ -87,6 +87,8 @@ static int put_object(struct store *st, const char *kind, const uint8_t h[HASH_L
     if (fd < 0)
         return -errno;
     r = write_all(fd, data, len);
+    if (r == 0 && fsync(fd) < 0)
+        r = -errno;
     if (close(fd) < 0 && r == 0)
         r = -errno;
     if (r == 0 && rename(tmp, path) < 0)
@@ -118,6 +120,12 @@ int bs_get_block(struct store *st, const uint8_t hash[HASH_LEN], void *buf, size
     if (r < 0)
         return (int)r;
     *len = (size_t)r;
+    {
+        uint8_t actual[HASH_LEN];
+        sha256(buf, *len, actual);
+        if (memcmp(actual, hash, HASH_LEN))
+            return -EIO;
+    }
     return 0;
 }
 
@@ -146,6 +154,7 @@ int bs_get_manifest(struct store *st, const uint8_t mhash[HASH_LEN], uint64_t *s
 {
     char path[PATH_MAX];
     struct manifest_hdr hdr;
+    struct stat sb;
     uint8_t (*b)[HASH_LEN] = NULL;
     ssize_t r;
     int fd;
@@ -156,7 +165,10 @@ int bs_get_manifest(struct store *st, const uint8_t mhash[HASH_LEN], uint64_t *s
     if (fd < 0)
         return -errno;
     r = read_full(fd, &hdr, sizeof(hdr));
-    if (r != (ssize_t)sizeof(hdr) || hdr.magic != MANIFEST_MAGIC) {
+    if (r != (ssize_t)sizeof(hdr) || hdr.magic != MANIFEST_MAGIC ||
+        fstat(fd, &sb) < 0 ||
+        (uint64_t)sb.st_size != sizeof(hdr) + (uint64_t)hdr.nblocks * HASH_LEN ||
+        hdr.nblocks != hdr.size / BLOCK_SIZE + (hdr.size % BLOCK_SIZE != 0)) {
         close(fd);
         return -EIO;
     }
@@ -174,6 +186,24 @@ int bs_get_manifest(struct store *st, const uint8_t mhash[HASH_LEN], uint64_t *s
         }
     }
     close(fd);
+    {
+        size_t total = sizeof(hdr) + (size_t)hdr.nblocks * HASH_LEN;
+        uint8_t actual[HASH_LEN];
+        char *encoded = malloc(total);
+        if (!encoded) {
+            free(b);
+            return -ENOMEM;
+        }
+        memcpy(encoded, &hdr, sizeof(hdr));
+        if (hdr.nblocks)
+            memcpy(encoded + sizeof(hdr), b, (size_t)hdr.nblocks * HASH_LEN);
+        sha256(encoded, total, actual);
+        free(encoded);
+        if (memcmp(actual, mhash, HASH_LEN)) {
+            free(b);
+            return -EIO;
+        }
+    }
     *size = hdr.size;
     *blocks = b;
     *n = hdr.nblocks;
@@ -197,7 +227,12 @@ int bs_snapshot_file(struct store *st, const char *fpath)
     fd = open(real, O_RDONLY);
     if (fd < 0)
         return -errno;
-    if (fstat(fd, &sb) < 0 || !S_ISREG(sb.st_mode)) {
+    if (fstat(fd, &sb) < 0) {
+        r = -errno;
+        close(fd);
+        return r;
+    }
+    if (!S_ISREG(sb.st_mode)) {
         close(fd);
         return 0;
     }
@@ -233,7 +268,10 @@ int bs_snapshot_file(struct store *st, const char *fpath)
         if (got < BLOCK_SIZE)
             break;
     }
-    fstat(fd, &sb);
+    if (fstat(fd, &sb) < 0) {
+        r = -errno;
+        goto out;
+    }
     if ((r = bs_put_manifest(st, total, (const uint8_t (*)[HASH_LEN])blocks, n, mhash)) < 0)
         goto out;
 

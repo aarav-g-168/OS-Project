@@ -35,19 +35,29 @@ int normalize_path(const char *in, char *out, size_t n)
         return -1;
     out[o++] = '/';
     while (*p) {
+        const char *component;
+        size_t len;
         while (*p == '/')
             p++;
         if (!*p)
             break;
+        component = p;
+        while (*p && *p != '/')
+            p++;
+        len = (size_t)(p - component);
+        if (len == 1 && component[0] == '.')
+            continue;
+        if (len == 2 && component[0] == '.' && component[1] == '.')
+            return -1;
         if (o > 1) {
             if (o + 1 >= n)
                 return -1;
             out[o++] = '/';
         }
-        while (*p && *p != '/') {
+        while (len--) {
             if (o + 1 >= n)
                 return -1;
-            out[o++] = *p++;
+            out[o++] = *component++;
         }
     }
     out[o] = '\0';
@@ -63,6 +73,10 @@ int store_path(const struct store *st, char *out, size_t n, const char *sub)
 /* Maps a filesystem path like "/a/b" to "<store>/current/a/b". */
 int store_real_path(const struct store *st, char *out, size_t n, const char *fpath)
 {
+    char normalized[JPATH_MAX];
+    if (normalize_path(fpath, normalized, sizeof(normalized)) < 0 ||
+        strcmp(fpath, normalized))
+        return -EINVAL;
     int r = snprintf(out, n, "%s/current%s", st->root, strcmp(fpath, "/") ? fpath : "");
     return (r < 0 || (size_t)r >= n) ? -ENAMETOOLONG : 0;
 }
@@ -226,6 +240,10 @@ int journal_read_all(const char *store_root, struct jrec **out, size_t *n)
         close(fd);
         return -errno;
     }
+    if (sb.st_size % sizeof(struct jrec)) {
+        close(fd);
+        return -EIO;  /* Never append after a torn tail or guess at missing history. */
+    }
     count = (size_t)sb.st_size / sizeof(struct jrec);
     if (count == 0) {
         close(fd);
@@ -238,18 +256,30 @@ int journal_read_all(const char *store_root, struct jrec **out, size_t *n)
     }
     while (got < count * sizeof(*recs)) {
         ssize_t r = read(fd, (char *)recs + got, count * sizeof(*recs) - got);
-        if (r <= 0)
-            break;
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r <= 0) {
+            int error = r < 0 ? -errno : -EIO;
+            free(recs);
+            close(fd);
+            return error;
+        }
         got += (size_t)r;
     }
     close(fd);
 
-    /* Keep only complete, well-formed records (a crash may leave a torn tail). */
+    /* Reject corruption; silently skipping records can invent a false history. */
     count = got / sizeof(*recs);
     for (i = 0, valid = 0; i < count; i++) {
-        if (recs[i].magic != JREC_MAGIC)
-            continue;
-        recs[i].path[JPATH_MAX - 1] = '\0';
+        char normalized[JPATH_MAX];
+        if (recs[i].magic != JREC_MAGIC ||
+            recs[i].op < OP_WRITE || recs[i].op > OP_RMDIR ||
+            recs[i].path[0] != '/' || !memchr(recs[i].path, '\0', JPATH_MAX) ||
+            normalize_path(recs[i].path, normalized, sizeof(normalized)) < 0 ||
+            strcmp(normalized, recs[i].path)) {
+            free(recs);
+            return -EIO;
+        }
         recs[valid++] = recs[i];
     }
     *out = recs;
@@ -277,45 +307,58 @@ int store_open(struct store *st, const char *dir, int create)
     st->lockfd = -1;
     pthread_rwlock_init(&st->lock, NULL);
     index_init(&st->idx);
-    if (!st->idx.buckets)
-        return -ENOMEM;
+    if (!st->idx.buckets) {
+        r = -ENOMEM;
+        goto fail;
+    }
 
-    if (create && mkdir_p(dir) < 0)
-        return -errno;
-    if (!realpath(dir, st->root))
-        return -errno;
+    if (create && (r = mkdir_p(dir)) < 0)
+        goto fail;
+    if (!realpath(dir, st->root)) {
+        r = -errno;
+        goto fail;
+    }
     if (!create) {
         snprintf(p, sizeof(p), "%s/journal.log", st->root);
         if (access(p, F_OK) < 0) {
             fprintf(stderr, "chronofs: %s is not a ChronoFS store (no journal.log)\n", st->root);
-            return -ENOENT;
+            r = -ENOENT;
+            goto fail;
         }
     }
     for (i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
         store_path(st, p, sizeof(p), subdirs[i]);
         if ((r = mkdir_p(p)) < 0)
-            return r;
+            goto fail;
     }
 
     store_path(st, p, sizeof(p), "journal.log");
     st->jfd = open(p, O_RDWR | O_APPEND | O_CREAT, 0644);
-    if (st->jfd < 0)
-        return -errno;
+    if (st->jfd < 0) {
+        r = -errno;
+        goto fail;
+    }
 
     if ((r = journal_read_all(st->root, &recs, &n)) < 0)
-        return r;
+        goto fail;
     for (i = 0; i < n; i++) {
         struct version v = {
             .ts_ns = recs[i].ts_ns, .mtime_ns = recs[i].mtime_ns,
             .size = recs[i].size, .mode = recs[i].mode, .op = recs[i].op,
         };
         memcpy(v.manifest, recs[i].manifest, HASH_LEN);
-        index_add(&st->idx, recs[i].path, &v);
+        if ((r = index_add(&st->idx, recs[i].path, &v)) < 0) {
+            free(recs);
+            goto fail;
+        }
         if (recs[i].ts_ns > st->last_ts)
             st->last_ts = recs[i].ts_ns;
     }
     free(recs);
     return 0;
+fail:
+    store_close(st);
+    return r;
 }
 
 void store_close(struct store *st)
@@ -329,6 +372,27 @@ void store_close(struct store *st)
     st->jfd = st->lockfd = -1;
 }
 
+/* Build a complete replacement before touching the current index or descriptors. */
+int store_reload(struct store *st)
+{
+    struct store fresh;
+    struct index old;
+    int fd, r = store_open(&fresh, st->root, 0);
+    if (r < 0)
+        return r;
+    pthread_rwlock_wrlock(&st->lock);
+    old = st->idx;
+    st->idx = fresh.idx;
+    fresh.idx = old;
+    fd = st->jfd;
+    st->jfd = fresh.jfd;
+    fresh.jfd = fd;
+    st->last_ts = fresh.last_ts;
+    pthread_rwlock_unlock(&st->lock);
+    store_close(&fresh);
+    return 0;
+}
+
 int store_append_locked(struct store *st, int op, const char *path, uint32_t mode,
                         int64_t mtime_ns, uint64_t size, const uint8_t *manifest)
 {
@@ -336,9 +400,10 @@ int store_append_locked(struct store *st, int op, const char *path, uint32_t mod
     struct version v;
     int64_t ts = now_ns();
     ssize_t w;
+    char normalized[JPATH_MAX];
 
-    if (strlen(path) >= JPATH_MAX)
-        return -ENAMETOOLONG;
+    if (normalize_path(path, normalized, sizeof(normalized)) < 0 || strcmp(path, normalized))
+        return -EINVAL;
     /* Timestamps are strictly increasing so every record has its own instant. */
     if (ts <= st->last_ts)
         ts = st->last_ts + 1;
@@ -355,7 +420,9 @@ int store_append_locked(struct store *st, int op, const char *path, uint32_t mod
     strcpy(rec.path, path);
 
     /* One write() of the whole record with O_APPEND: no interleaving. */
-    w = write(st->jfd, &rec, sizeof(rec));
+    do {
+        w = write(st->jfd, &rec, sizeof(rec));
+    } while (w < 0 && errno == EINTR);
     if (w != (ssize_t)sizeof(rec))
         return w < 0 ? -errno : -EIO;
 

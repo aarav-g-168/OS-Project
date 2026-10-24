@@ -111,7 +111,11 @@ int cmd_log(int argc, char **argv)
     if (open_store(&st, argv[0]) < 0)
         return 1;
     if (argc > 1) {
-        normalize_path(argv[1], filter, sizeof(filter));
+        if (normalize_path(argv[1], filter, sizeof(filter)) < 0) {
+            fprintf(stderr, "chronofs: invalid path (too long or contains ..)\n");
+            store_close(&st);
+            return 2;
+        }
         fl = strlen(filter);
     }
     if (journal_read_all(st.root, &recs, &n) < 0) {
@@ -195,7 +199,7 @@ int cmd_tag(int argc, char **argv)
         if (!isalnum((unsigned char)*s) && *s != '-' && *s != '_' && *s != '.')
             break;
     }
-    if (*s || argv[1][0] == '.' || parse_when(argv[1], now_ns(), &dummy) == 0 ||
+    if (!argv[1][0] || *s || argv[1][0] == '.' || parse_when(argv[1], now_ns(), &dummy) == 0 ||
         strlen(argv[1]) > 64) {
         fprintf(stderr, "chronofs: bad tag name '%s' (use letters, digits, - _ . ; "
                 "must not look like a time)\n", argv[1]);
@@ -240,8 +244,11 @@ int cmd_ls(int argc, char **argv)
     }
     if (open_store(&st, argv[0]) < 0)
         return 1;
-    if (argc > 1)
-        normalize_path(argv[1], dir, sizeof(dir));
+    if (argc > 1 && normalize_path(argv[1], dir, sizeof(dir)) < 0) {
+        fprintf(stderr, "chronofs: invalid path (too long or contains ..)\n");
+        store_close(&st);
+        return 2;
+    }
     if (get_time(&st, at, &t) < 0) {
         store_close(&st);
         return 1;
@@ -344,7 +351,11 @@ int cmd_cat(int argc, char **argv)
     }
     if (open_store(&st, argv[0]) < 0)
         return 1;
-    normalize_path(argv[1], path, sizeof(path));
+    if (normalize_path(argv[1], path, sizeof(path)) < 0) {
+        fprintf(stderr, "chronofs: invalid path (too long or contains ..)\n");
+        store_close(&st);
+        return 2;
+    }
     if (get_time(&st, at, &t) < 0) {
         store_close(&st);
         return 1;
@@ -412,7 +423,11 @@ int cmd_restore(int argc, char **argv)
     }
     if (open_store(&st, argv[0]) < 0)
         return 1;
-    normalize_path(argv[1], path, sizeof(path));
+    if (normalize_path(argv[1], path, sizeof(path)) < 0) {
+        fprintf(stderr, "chronofs: invalid path (too long or contains ..)\n");
+        store_close(&st);
+        return 2;
+    }
     if (get_time(&st, at, &t) < 0) {
         store_close(&st);
         return 1;
@@ -455,7 +470,11 @@ int cmd_restore(int argc, char **argv)
         if (!out && !(mounted && mp[0])) {
             char saved[JPATH_MAX];
             snprintf(saved, sizeof(saved), "%s", p->path);
-            bs_snapshot_file(&st, saved);
+            if ((r = bs_snapshot_file(&st, saved)) < 0) {
+                fprintf(stderr, "chronofs: cannot record restored file: %s\n", strerror(-r));
+                failed++;
+                continue;
+            }
         }
         printf("restored %s (as of %s) -> %s\n", p->path, tbuf, dest);
         restored++;

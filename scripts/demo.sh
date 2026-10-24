@@ -27,7 +27,11 @@ done
 
 BIN="$PWD/chronofs"
 export PATH="$PWD:$PATH"
-BASE=/tmp/chronofs-demo
+if [ ! -c /dev/fuse ]; then
+    echo 'demo.sh: /dev/fuse is required; use a FUSE-capable Linux host.' >&2
+    exit 1
+fi
+BASE=$(mktemp -d "${TMPDIR:-/tmp}/chronofs-demo.XXXXXX")
 S=$BASE/store
 M=$BASE/mnt
 
@@ -48,10 +52,6 @@ cleanup() {
 trap cleanup EXIT
 
 [ -x "$BIN" ] || make -s
-cleanup
-# Step 7 may have copied read-only snapshot permissions into current/.
-chmod -R u+w "$BASE" 2>/dev/null || true
-rm -rf "$BASE" || true
 mkdir -p "$S" "$M"
 
 step "1. Mount a fresh ChronoFS store"

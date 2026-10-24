@@ -202,6 +202,8 @@ static void timeline_build(struct app *a)
     struct jrec *recs = NULL;
     size_t n = 0, i;
 
+    for (i = 0; i < a->nmom; i++)
+        free(a->mom[i].path);
     free(a->mom);
     a->mom = NULL;
     a->nmom = 0;
@@ -853,6 +855,7 @@ static void do_restore(struct app *a, struct ui *u)
     for (i = 0; i < a->st.idx.nall; i++) {
         struct pentry *p = a->st.idx.all[i];
         const struct version *v;
+        struct version saved_version;
         char dest[PATH_MAX];
         int fd, r;
 
@@ -862,6 +865,8 @@ static void do_restore(struct app *a, struct ui *u)
         v = pentry_at(p, a->t);
         if (!v || v->op != OP_WRITE)
             continue;
+        saved_version = *v;
+        v = &saved_version;
         if (mounted && mp[0])
             snprintf(dest, sizeof(dest), "%s%s", mp, p->path);
         else
@@ -881,8 +886,10 @@ static void do_restore(struct app *a, struct ui *u)
             failed++;
             continue;
         }
-        if (!(mounted && mp[0]))
-            bs_snapshot_file(&a->st, p->path);   /* record the recovery */
+        if (!(mounted && mp[0]) && bs_snapshot_file(&a->st, p->path) < 0) {
+            failed++;
+            continue;
+        }
         n++;
     }
     if (n == 0)
@@ -1027,14 +1034,20 @@ static int handle_key(struct app *a, struct ui *u, int ch)
             set_msg(a, "filter cleared", NULL);
         break;
     }
-    case 'R':
+    case 'R': {
+        if (store_reload(&a->st) < 0) {
+            set_msg(a, "cannot reload store", NULL);
+            break;
+        }
         timeline_build(a);
         if (a->nmom > 0 && a->msel >= (int)a->nmom)
             a->msel = (int)a->nmom - 1;
         tree_reload(a);
         preview_load(a);
+        set_time(a);
         set_msg(a, "store reloaded", NULL);
         break;
+    }
     case '?':
     case KEY_F(1):
         draw_help(a, u);

@@ -240,13 +240,13 @@ static struct fh *get_fh(struct fuse_file_info *fi)
 }
 
 /* Turn the current contents of path into a new version. */
-static void record_version(const char *path)
+static int record_version(const char *path)
 {
     int r;
     size_t before;
 
     if (!path)
-        return;                     /* file was deleted while open */
+        return 0;                   /* file was deleted while open */
     pthread_rwlock_rdlock(&G.st->lock);
     before = G.st->idx.nrecords;
     pthread_rwlock_unlock(&G.st->lock);
@@ -254,7 +254,7 @@ static void record_version(const char *path)
     r = bs_snapshot_file(G.st, path);
     if (r < 0) {
         fprintf(stderr, "chronofs: snapshot of %s failed: %s\n", path, strerror(-r));
-        return;
+        return r;
     }
     pthread_rwlock_rdlock(&G.st->lock);
     if (G.st->idx.nrecords != before) {
@@ -263,6 +263,7 @@ static void record_version(const char *path)
         pthread_mutex_unlock(&G.stat_mu);
     }
     pthread_rwlock_unlock(&G.st->lock);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -680,7 +681,9 @@ static int cfs_flush(const char *path, struct fuse_file_info *fi)
 {
     struct fh *h = get_fh(fi);
     if (h->kind == FH_REAL && h->wrote) {
-        record_version(path);
+        int r = record_version(path);
+        if (r < 0)
+            return r;
         h->dirty = h->wrote = 0;
     }
     return 0;
@@ -689,15 +692,17 @@ static int cfs_flush(const char *path, struct fuse_file_info *fi)
 static int cfs_release(const char *path, struct fuse_file_info *fi)
 {
     struct fh *h = get_fh(fi);
+    int r = 0;
     if (h->kind == FH_REAL) {
         if (h->dirty)
-            record_version(path);
-        close(h->fd);
+            r = record_version(path);
+        if (close(h->fd) < 0 && r == 0)
+            r = -errno;
     }
     free(h->blocks);
     free(h->text);
     free(h);
-    return 0;
+    return r;
 }
 
 static int cfs_fsync(const char *path, int datasync, struct fuse_file_info *fi)
@@ -708,10 +713,12 @@ static int cfs_fsync(const char *path, int datasync, struct fuse_file_info *fi)
     if ((datasync ? fdatasync(h->fd) : fsync(h->fd)) < 0)
         return -errno;
     if (h->dirty) {
-        record_version(path);
+        int r = record_version(path);
+        if (r < 0)
+            return r;
         h->dirty = h->wrote = 0;
     }
-    return 0;
+    return fsync(G.st->jfd) < 0 ? -errno : 0;
 }
 
 static int cfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
@@ -733,8 +740,7 @@ static int cfs_truncate(const char *path, off_t size, struct fuse_file_info *fi)
         return r;
     if (truncate(real, size) < 0)
         return -errno;
-    record_version(path);
-    return 0;
+    return record_version(path);
 }
 
 static int cfs_unlink(const char *path)
@@ -750,10 +756,11 @@ static int cfs_unlink(const char *path)
     if (unlink(real) < 0)
         return -errno;
     pthread_rwlock_wrlock(&G.st->lock);
+    r = 0;
     if (version_live(index_at(&G.st->idx, path, INT64_MAX)))
-        store_append_locked(G.st, OP_UNLINK, path, 0, now_ns(), 0, NULL);
+        r = store_append_locked(G.st, OP_UNLINK, path, 0, now_ns(), 0, NULL);
     pthread_rwlock_unlock(&G.st->lock);
-    return 0;
+    return r;
 }
 
 static int cfs_mkdir(const char *path, mode_t mode)
@@ -768,8 +775,7 @@ static int cfs_mkdir(const char *path, mode_t mode)
         return r;
     if (mkdir(real, mode) < 0)
         return -errno;
-    store_append(G.st, OP_MKDIR, path, S_IFDIR | (mode & 07777), now_ns(), 0, NULL);
-    return 0;
+    return store_append(G.st, OP_MKDIR, path, S_IFDIR | (mode & 07777), now_ns(), 0, NULL);
 }
 
 static int cfs_rmdir(const char *path)
@@ -784,8 +790,7 @@ static int cfs_rmdir(const char *path)
         return r;
     if (rmdir(real) < 0)
         return -errno;
-    store_append(G.st, OP_RMDIR, path, 0, now_ns(), 0, NULL);
-    return 0;
+    return store_append(G.st, OP_RMDIR, path, 0, now_ns(), 0, NULL);
 }
 
 /*
@@ -855,7 +860,7 @@ static int cfs_rename(const char *from, const char *to, unsigned int flags)
         free(olds[i]);
     free(olds);
     if (need_snapshot)
-        record_version(to);
+        return record_version(to);
     return 0;
 }
 
@@ -874,7 +879,7 @@ static int cfs_chmod(const char *path, mode_t mode, struct fuse_file_info *fi)
     if (chmod(real, mode) < 0)
         return -errno;
     if (lstat(real, &sb) == 0 && S_ISREG(sb.st_mode))
-        record_version(path);
+        return record_version(path);
     return 0;
 }
 
@@ -909,7 +914,7 @@ static int cfs_utimens(const char *path, const struct timespec tv[2], struct fus
     if (fi && get_fh(fi)->dirty)
         return 0;
     if (lstat(real, &sb) == 0 && S_ISREG(sb.st_mode))
-        record_version(path);
+        return record_version(path);
     return 0;
 }
 
@@ -1005,9 +1010,12 @@ static int reconcile_dir(const char *fpath, int *changes)
     DIR *d;
     struct dirent *de;
     struct stat sb;
+    int r;
 
-    if (real_path(fpath, real) < 0 || !(d = opendir(real)))
-        return 0;
+    if ((r = real_path(fpath, real)) < 0)
+        return r;
+    if (!(d = opendir(real)))
+        return -errno;
     while ((de = readdir(d))) {
         const struct version *v;
         int64_t mt;
@@ -1022,16 +1030,26 @@ static int reconcile_dir(const char *fpath, int *changes)
         v = index_at(&G.st->idx, child, INT64_MAX);
         if (S_ISDIR(sb.st_mode)) {
             if (!v || v->op != OP_MKDIR) {
-                store_append(G.st, OP_MKDIR, child, sb.st_mode, now_ns(), 0, NULL);
+                r = store_append(G.st, OP_MKDIR, child, sb.st_mode, now_ns(), 0, NULL);
+                if (r < 0) {
+                    closedir(d);
+                    return r;
+                }
                 (*changes)++;
             }
-            reconcile_dir(child, changes);
+            if ((r = reconcile_dir(child, changes)) < 0) {
+                closedir(d);
+                return r;
+            }
         } else if (S_ISREG(sb.st_mode)) {
             mt = (int64_t)sb.st_mtim.tv_sec * NS_PER_SEC + sb.st_mtim.tv_nsec;
             if (!v || v->op != OP_WRITE || v->size != (uint64_t)sb.st_size ||
                 v->mtime_ns != mt || v->mode != sb.st_mode) {
                 size_t before = G.st->idx.nrecords;
-                bs_snapshot_file(G.st, child);
+                if ((r = bs_snapshot_file(G.st, child)) < 0) {
+                    closedir(d);
+                    return r;
+                }
                 if (G.st->idx.nrecords != before)
                     (*changes)++;
             }
@@ -1043,12 +1061,13 @@ static int reconcile_dir(const char *fpath, int *changes)
 
 static int reconcile(void)
 {
-    int changes = 0;
+    int changes = 0, r;
     size_t i, n;
     char real[PATH_MAX];
     struct stat sb;
 
-    reconcile_dir("/", &changes);
+    if ((r = reconcile_dir("/", &changes)) < 0)
+        return r;
 
     /* Paths the journal thinks exist but which are gone from current/. */
     n = G.st->idx.nall;
@@ -1063,7 +1082,9 @@ static int reconcile(void)
             continue;
         if (lstat(real, &sb) < 0 ||
             (v->op == OP_MKDIR) != (S_ISDIR(sb.st_mode) != 0)) {
-            store_append(G.st, v->op == OP_MKDIR ? OP_RMDIR : OP_UNLINK, path, 0, now_ns(), 0, NULL);
+            r = store_append(G.st, v->op == OP_MKDIR ? OP_RMDIR : OP_UNLINK, path, 0, now_ns(), 0, NULL);
+            if (r < 0)
+                return r;
             changes++;
         }
     }
@@ -1085,6 +1106,11 @@ int fs_main(struct store *st, const char *mountpoint, int argc, char **argv, siz
     }
 
     changes = reconcile();
+    if (changes < 0) {
+        fprintf(stderr, "chronofs: reconciliation failed: %s\n", strerror(-changes));
+        lru_destroy(G.cache);
+        return 1;
+    }
     if (changes)
         printf("chronofs: recorded %d change(s) made while unmounted\n", changes);
     printf("chronofs: %s mounted on %s (%zu versions in journal)\n",

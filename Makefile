@@ -34,4 +34,18 @@ demo: chronofs
 clean:
 	rm -rf build chronofs
 
-.PHONY: demo clean
+build/test-core: tests/core.c $(filter-out build/main.o build/fs.o build/tui.o build/cmd.o build/gc.o,$(OBJS)) | build
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+build/test-fs: tests/fs_callbacks.c src/fs.c $(filter-out build/main.o build/fs.o build/tui.o build/cmd.o build/gc.o,$(OBJS)) | build
+	$(CC) $(CFLAGS) -o $@ $(filter-out src/fs.c,$^) $(LDLIBS)
+
+test: chronofs build/test-core build/test-fs
+	@task_store=$$(mktemp -d); trap 'rm -rf "$$task_store"' EXIT; ./build/test-core "$$task_store"
+	@task_store=$$(mktemp -d); trap 'rm -rf "$$task_store"' EXIT; ./build/test-fs "$$task_store"
+	CHRONOFS_TEST_NO_TUI=$(if $(filter 0,$(HAVE_NCURSES)),1,) python3 tests/integration.py
+
+test-mount: chronofs
+	bash scripts/test-mount.sh
+
+.PHONY: demo clean test test-mount

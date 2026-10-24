@@ -16,8 +16,9 @@ The core is plain C and needs only libfuse. The optional timeline browser also n
 
 ## Quick start
 
-FUSE needs a Linux kernel. On macOS or Windows, use the provided Docker container. The
-container gives you a Linux kernel.
+FUSE needs a Linux kernel and a usable `/dev/fuse` device with permission to mount.
+On macOS or Windows, use a Linux VM with FUSE support. Docker requires a Linux host
+or VM that exposes `/dev/fuse`; a container alone cannot supply the missing device.
 
 ```bash
 ./scripts/dev.sh            # opens a Linux shell with FUSE enabled, repo at /src
@@ -28,6 +29,24 @@ make                        # builds ./chronofs
 
 On a Linux machine, you can skip Docker. Install `libfuse3-dev fuse3 pkg-config build-essential`.
 Then run `make`.
+
+On Debian/Ubuntu:
+
+```bash
+sudo apt-get update
+sudo apt-get install build-essential pkg-config libfuse3-dev fuse3 libncurses-dev python3
+make
+make test                    # core, CLI, FUSE callback and terminal regressions
+make test-mount              # additionally requires /dev/fuse and mount permission
+```
+
+The automated suite works without a mounted filesystem. GitHub Actions builds and
+tests both with and without the optional ncurses browser. The mounted test uses a
+fresh temporary directory and removes it after unmounting. The demo also uses a
+unique temporary directory, but leaves its store for further exploration.
+
+See `docs/PROJECT_REPORT.md` for the implementation report and `docs/TESTING.md`
+for verification details and commands.
 
 The interactive timeline browser (`chronofs tui`) is optional. It uses ncurses. If the build
 finds `ncursesw`, it compiles the browser in. If not, `make` builds everything else, and
@@ -140,8 +159,10 @@ the new version.
 - **The in-memory index** is a hash table. It maps each path to its versions, sorted by time.
   A lookup at time T is a hash lookup and a binary search. A `pthread_rwlock_t` protects the
   index, because libfuse serves requests from several threads.
-- **Crash safety:** the code writes each object to a temp file, then renames the temp file.
-  Each journal record is a single `O_APPEND` `write()`. At mount time, the code reconciles
+- **Error handling:** the code writes and syncs each new object to a temp file, then renames it.
+  Reads verify block and manifest hashes. Each journal record is a single `O_APPEND`
+  `write()`. A malformed or incomplete journal is rejected rather than silently losing
+  records; back up the store before attempting manual recovery. At mount time, the code reconciles
   the journal with `current/`. The code records anything that changed while the store was
   unmounted. This step works like a small fsck.
 - **One daemon per store:** `flock()` enforces this limit. `gc` refuses to run while the
@@ -172,3 +193,13 @@ the new version.
   Content-defined chunking would fix this.
 - A snapshot directory listing scans every tracked path. The cost is O(paths). This cost is
   acceptable for project-sized trees.
+- This is an educational filesystem for trusted, local users. It is not a security
+  sandbox or a substitute for backups. Symlinks can lead outside the store.
+- Use one writer per file at a time. Concurrent writes to the same file are not
+  transactional snapshots. Do not run offline restore, edit `current/`, or run GC
+  concurrently with other offline writers. GC refuses to run while mounted.
+- File restores recreate file contents and permissions; they do not restore ownership,
+  extended attributes, original timestamps, or empty directories.
+- Object syncing and journal validation improve failure handling, but the store is not
+  a fully transactional, power-loss-proof filesystem. Journal records use native C
+  layout and byte order, so stores are not a portable interchange format.

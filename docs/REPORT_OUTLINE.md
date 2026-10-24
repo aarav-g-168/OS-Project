@@ -1,5 +1,10 @@
 # ChronoFS — Project Report Outline
 
+This is the original planning outline. Its sample checkmarks and measurements
+are illustrative and are not evidence of verification in the current environment.
+Use `PROJECT_REPORT.md` for the implementation report and `TESTING.md` for
+repeatable checks and the remaining mounted-validation requirement.
+
 **Course:** BITE303P Operating Systems Lab
 **Title:** ChronoFS: A Userspace Time-Travel Filesystem with Transparent Versioning (FUSE)
 

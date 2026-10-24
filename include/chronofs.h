@@ -100,6 +100,7 @@ void hash_to_hex(const uint8_t h[HASH_LEN], char out[HASH_HEX_LEN + 1]);
 
 /* ---- journal.c : store + index ---- */
 int  store_open(struct store *st, const char *dir, int create);
+int  store_reload(struct store *st);
 void store_close(struct store *st);
 int  store_path(const struct store *st, char *out, size_t n, const char *sub);
 int  store_real_path(const struct store *st, char *out, size_t n, const char *fpath);
