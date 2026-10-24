@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ChronoFS end-to-end demo.
 #
-#   ./scripts/demo.sh               run straight through
+#   ./scripts/
+.sh               run straight through
 #   ./scripts/demo.sh --pause       wait for Enter between steps (for presenting)
 #   ./scripts/demo.sh --interactive also open the ncurses timeline browser
 #                                   mid-demo, while the history is rich
