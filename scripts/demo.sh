@@ -139,4 +139,4 @@ run "chronofs gc $S --keep 5s"
 run "chronofs stats $S | grep -E 'records|blocks'"
 
 echo
-echo "${bold}Demo complete.${reset}  Store left at $S"
+echo "${bold}Demo complete. Thankyou for listening.${reset}  Store left at $S"
